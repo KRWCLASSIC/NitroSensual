@@ -5,14 +5,11 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QSize
 from PyQt5.QtGui import QPainter, QColor
 from elevate import elevate
-import urllib.request
+import pywintypes
 import win32file
-import tempfile
-import zipfile
 import winreg
 import struct
 import json
-import clr
 import sys
 import os
 
@@ -128,81 +125,57 @@ class ProgressDialog(QDialog):
         self.setLayout(layout)
         self.setFixedSize(350, 80)
 
-def ensure_lhm_dll(show_progress=False):
-    global LHM_DLL_PATH
-    if LHM_DLL_PATH is not None:
-        return LHM_DLL_PATH
-    dll_name = "LibreHardwareMonitorLib.dll"
-    dll_path = os.path.join(APP_DIR, dll_name)
-    print(f"Checking for DLL at {dll_path}")
-    progress = None
-    app = QApplication.instance()
-    if not os.path.exists(dll_path):
-        print("DLL not found, starting download...")
-        if show_progress and app is not None:
-            progress = ProgressDialog("Resolving LibreHardwareMonitorLib.dll, please wait...")
-            progress.show()
-            app.processEvents()
-        url = "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/v0.9.4/LibreHardwareMonitor-net472.zip"
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                zip_path = os.path.join(tmpdir, "lhm.zip")
-                print(f"Downloading {url} ...")
-                urllib.request.urlretrieve(url, zip_path)
-                print("Download complete. Extracting DLL...")
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    for member in zip_ref.namelist():
-                        if member.endswith(dll_name):
-                            zip_ref.extract(member, tmpdir)
-                            src = os.path.join(tmpdir, member)
-                            # Copy DLL to current directory
-                            with open(src, 'rb') as fsrc, open(dll_path, 'wb') as fdst:
-                                fdst.write(fsrc.read())
-                            print(f"Extracted {dll_name} to current directory.")
-                            break
-        except Exception as e:
-            print(f"Failed to download DLL: {e}")
-            if progress:
-                progress.close()
-            raise
-        if progress:
-            progress.close()
-    else:
-        print("DLL already present.")
-    LHM_DLL_PATH = dll_path
-    return dll_path
+SYSTEM_HEALTH_INDEXES = {
+    1: "CPU_Temperature",
+    2: "CPU_Fan_Speed",
+    6: "GPU_Fan_Speed",
+    10: "GPU1_Temperature",
+}
 
-def get_lhm_temps():
+def send_command_by_named_pipe(pipe, cmd_code: int, args: list):
+    message = bytearray()
+    message += struct.pack("<H", cmd_code)
+    message += struct.pack("<B", len(args))
+    for arg in args:
+        message += struct.pack("<I", len(arg))
+        message += arg
+    win32file.WriteFile(pipe, message)
+    win32file.FlushFileBuffers(pipe)
+
+def get_acer_gaming_system_info(index: int):
+    input_code = 1 | (index << 8)
+    arg = struct.pack("<I", input_code)
     try:
-        dll_path = ensure_lhm_dll(show_progress=True)
-        unblock_file_if_needed(dll_path)
-        clr.AddReference(dll_path)
-        from LibreHardwareMonitor import Hardware  # type: ignore
+        pipe = win32file.CreateFile(
+            r"\\.\pipe\PredatorSense_service_namedpipe",
+            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+            0, None, win32file.OPEN_EXISTING, 0, None
+        )
+        send_command_by_named_pipe(pipe, 13, [arg])
+        _, raw = win32file.ReadFile(pipe, 13)
+        result = struct.unpack_from("<Q", raw, 5)[0]
+        win32file.CloseHandle(pipe)
+        return result
+    except (pywintypes.error, Exception):
+        return None
 
-        computer = Hardware.Computer()
-        computer.IsCpuEnabled = True
-        computer.IsGpuEnabled = True
-        computer.Open()
+def decode_result(result):
+    if result is None:
+        return None
+    if result & 0xFF == 0:
+        return (result >> 8) & 0xFFFF
+    return None
 
-        cpu_temp = None
-        gpu_temp = None
-
-        for hardware in computer.Hardware:
-            hardware.Update()
-            if hardware.HardwareType == Hardware.HardwareType.Cpu:
-                for sensor in hardware.Sensors:
-                    if sensor.SensorType == Hardware.SensorType.Temperature and "package" in sensor.Name.lower():
-                        cpu_temp = sensor.Value
-            if hardware.HardwareType == Hardware.HardwareType.GpuNvidia or hardware.HardwareType == Hardware.HardwareType.GpuAmd:
-                for sensor in hardware.Sensors:
-                    if sensor.SensorType == Hardware.SensorType.Temperature and "core" in sensor.Name.lower():
-                        gpu_temp = sensor.Value
-
-        computer.Close()
-        return cpu_temp, gpu_temp
-    except Exception as e:
-        print(e)
-        return None, None
+def get_cpu_gpu_temp_and_rpm():
+    cpu_temp_raw = get_acer_gaming_system_info(1)
+    cpu_rpm_raw = get_acer_gaming_system_info(2)
+    gpu_temp_raw = get_acer_gaming_system_info(10)
+    gpu_rpm_raw = get_acer_gaming_system_info(6)
+    cpu_temp = decode_result(cpu_temp_raw)
+    cpu_rpm = decode_result(cpu_rpm_raw)
+    gpu_temp = decode_result(gpu_temp_raw)
+    gpu_rpm = decode_result(gpu_rpm_raw)
+    return cpu_temp, cpu_rpm, gpu_temp, gpu_rpm
 
 class FanControlWidget(QWidget):
     def __init__(self, fan_type: str, refresh_callback=None):
@@ -221,7 +194,7 @@ class FanControlWidget(QWidget):
         self.value_label = QLabel(f"{self.slider.value()}%")
         self.slider.valueChanged.connect(self.on_slider_changed)
         self.apply_btn = QPushButton("Apply")
-        self.apply_btn.clicked.connect(lambda: self.apply_fan_speed(show_message=True))
+        self.apply_btn.clicked.connect(lambda: self.apply_fan_speed())
         layout.addWidget(self.label)
         layout.addWidget(self.slider)
         layout.addWidget(self.value_label)
@@ -248,18 +221,28 @@ class FanControlWidget(QWidget):
             # Restore last custom value to slider
             self.slider.setValue(self.last_custom_value)
 
-    def set_fan_speed(self, percent: int, show_message=False):
+    def set_fan_speed(self, percent: int):
         self.slider.setValue(percent)
-        self.apply_fan_speed(show_message=show_message)
+        self.apply_fan_speed()
         self.last_custom_value = percent  # Update last custom value
 
-    def apply_fan_speed(self, show_message=True):
+    def apply_fan_speed(self):
         percent = self.slider.value()
         try:
             write_registry(self.fan_type, percent)
             apply_fan_speed(self.fan_type, percent)
             if self.refresh_callback:
                 self.refresh_callback()
+            # Save config to disk when Apply is clicked
+            main = self.parentWidget()
+            while main and not isinstance(main, MainWindow):
+                main = main.parentWidget()
+            if main and main.current_mode == "Custom":
+                if self.fan_type == "cpu":
+                    main.config["custom_cpu"] = percent
+                elif self.fan_type == "gpu":
+                    main.config["custom_gpu"] = percent
+                save_config(main.config)
         except Exception:
             pass
 
@@ -416,7 +399,7 @@ class RangeSliderWidget(QWidget):
         }
 
 class TempWorker(QThread):
-    temps_updated = pyqtSignal(object, object)  # cpu_temp, gpu_temp
+    temps_updated = pyqtSignal(object, object, object, object)  # cpu_temp, cpu_rpm, gpu_temp, gpu_rpm
 
     def __init__(self, poll_interval=2):
         super().__init__()
@@ -426,8 +409,8 @@ class TempWorker(QThread):
     def run(self):
         import time
         while self._running:
-            cpu_temp, gpu_temp = get_lhm_temps()
-            self.temps_updated.emit(cpu_temp, gpu_temp)
+            cpu_temp, cpu_rpm, gpu_temp, gpu_rpm = get_cpu_gpu_temp_and_rpm()
+            self.temps_updated.emit(cpu_temp, cpu_rpm, gpu_temp, gpu_rpm)
             time.sleep(self.poll_interval)
 
     def stop(self):
@@ -473,13 +456,16 @@ class AutoFanConfigDialog(QDialog):
             self.add_row(entry["min"], entry["max"], entry["speed"])
 
         add_btn = QPushButton("Add Range")
+        add_btn.setFocusPolicy(Qt.NoFocus)
         add_btn.clicked.connect(self.add_row)
         self.layout.addWidget(add_btn)
 
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save")
+        save_btn.setFocusPolicy(Qt.NoFocus)
         save_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(save_btn)
         btn_layout.addWidget(cancel_btn)
@@ -544,6 +530,7 @@ class AutoFanConfigDialog(QDialog):
         speed_spin.setSuffix("%")
 
         remove_btn = QPushButton("Remove")
+        remove_btn.setFocusPolicy(Qt.NoFocus)  # Add this line
         remove_btn.setFixedWidth(60)
 
         def update_remove_buttons():
@@ -703,14 +690,16 @@ class MainWindow(QWidget):
         super().__init__()
         self.config = load_config()
         self.cpu_temp = None
+        self.cpu_rpm = None
         self.gpu_temp = None
+        self.gpu_rpm = None
         self.auto_fan_config = self.config.get("auto_fan_config", DEFAULT_CONFIG["auto_fan_config"])
         self.current_mode = self.config.get("mode", "Custom")
         self.init_ui()
         self.start_temp_worker()
 
     def init_ui(self):
-        self.setWindowTitle("NitroSensual 1.1")
+        self.setWindowTitle("NitroSensual 1.2")
         self.layout = QVBoxLayout()
 
         # Mode dropdown and graph button
@@ -783,17 +772,18 @@ class MainWindow(QWidget):
         self.temp_worker.temps_updated.connect(self.on_temps_updated)
         self.temp_worker.start()
 
-    def on_temps_updated(self, cpu_temp, gpu_temp):
+    def on_temps_updated(self, cpu_temp, cpu_rpm, gpu_temp, gpu_rpm):
         self.cpu_temp = cpu_temp
+        self.cpu_rpm = cpu_rpm
         self.gpu_temp = gpu_temp
+        self.gpu_rpm = gpu_rpm
         self.update_temp_labels()
-        # If in auto mode, update fan speeds
         if getattr(self, "current_mode", None) == "Auto":
             self.apply_auto_fan_speeds()
 
     def update_temp_labels(self):
-        cpu_temp_text = f"CPU Temp: {self.cpu_temp:.1f}°C" if self.cpu_temp is not None else "CPU Temp: ?"
-        gpu_temp_text = f"GPU Temp: {self.gpu_temp:.1f}°C" if self.gpu_temp is not None else "GPU Temp: ?"
+        cpu_temp_text = f"CPU Temp: {self.cpu_temp if self.cpu_temp is not None else '?'}°C"
+        gpu_temp_text = f"GPU Temp: {self.gpu_temp if self.gpu_temp is not None else '?'}°C"
         self.cpu_temp_label.setText(cpu_temp_text)
         self.gpu_temp_label.setText(gpu_temp_text)
 
@@ -804,8 +794,8 @@ class MainWindow(QWidget):
         if mode == "Custom":
             self.cpu_fan_widget.set_custom_mode(True)
             self.gpu_fan_widget.set_custom_mode(True)
-            self.cpu_fan_widget.apply_fan_speed(show_message=False)
-            self.gpu_fan_widget.apply_fan_speed(show_message=False)
+            self.cpu_fan_widget.apply_fan_speed()
+            self.gpu_fan_widget.apply_fan_speed()
             self.config["custom_cpu"] = self.cpu_fan_widget.slider.value()
             self.config["custom_gpu"] = self.gpu_fan_widget.slider.value()
         elif mode == "Max":
@@ -822,9 +812,10 @@ class MainWindow(QWidget):
     def refresh_speeds(self):
         cpu_percent = read_fan_percentage("cpu")
         gpu_percent = read_fan_percentage("gpu")
-        # Only update fan speed labels, not temps
-        cpu_text = f"CPU Fan Current Speed: {cpu_percent if cpu_percent >= 0 else '?'}%"
-        gpu_text = f"GPU Fan Current Speed: {gpu_percent if gpu_percent >= 0 else '?'}%"
+        cpu_rpm = self.cpu_rpm if self.cpu_rpm is not None else '?'
+        gpu_rpm = self.gpu_rpm if self.gpu_rpm is not None else '?'
+        cpu_text = f"CPU Fan Current Speed: {cpu_percent if cpu_percent >= 0 else '?'}% ({cpu_rpm} RPM)"
+        gpu_text = f"GPU Fan Current Speed: {gpu_percent if gpu_percent >= 0 else '?'}% ({gpu_rpm} RPM)"
         self.cpu_speed_label.setText(cpu_text)
         self.gpu_speed_label.setText(gpu_text)
 
@@ -894,7 +885,6 @@ class MainWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    ensure_lhm_dll(show_progress=True)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

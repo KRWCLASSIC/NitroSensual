@@ -1,2 +1,4 @@
+@echo off
 pyinstaller --windowed --onefile nitrosensual.py
-rm nitrosensual.spec
+del /Q nitrosensual.spec 
+rmdir /S /Q build
