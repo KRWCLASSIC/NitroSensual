@@ -12,6 +12,7 @@ import struct
 import json
 import sys
 import os
+from predator_wmi import PredatorWmiBackend, local_model_supported
 
 LHM_DLL_PATH = None
 
@@ -25,6 +26,8 @@ def get_app_dir():
 
 APP_DIR = get_app_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+IS_PREDATOR = local_model_supported()
+PREDATOR_BACKEND = PredatorWmiBackend()  # Does not connect until a method is called.
 
 DEFAULT_CONFIG = {
     "auto_fan_config": [
@@ -65,6 +68,12 @@ def save_config(config):
 
 # Helper to read current fan percentage from registry
 def read_fan_percentage(fan_type: str) -> int:
+    if IS_PREDATOR:
+        try:
+            return PREDATOR_BACKEND.get_percent(fan_type)
+        except Exception as e:
+            print("Predator fan read failed:", e)
+            return -1
     key_path = r"SOFTWARE\\OEM\\NitroSense\\FanControl"
     value_name = "CPUFanPercentage" if fan_type == "cpu" else "GPU1FanPercentage"
     try:
@@ -76,6 +85,8 @@ def read_fan_percentage(fan_type: str) -> int:
 
 # Helper to write fan percentage to registry
 def write_registry(fan_type: str, percent: int):
+    if IS_PREDATOR:
+        return  # Predator WMI does not use the NitroSense registry key.
     key_path = r"SOFTWARE\\OEM\\NitroSense\\FanControl"
     value_name = "CPUFanPercentage" if fan_type == "cpu" else "GPU1FanPercentage"
     with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
@@ -83,6 +94,16 @@ def write_registry(fan_type: str, percent: int):
 
 # Helper to apply fan speed via named pipe
 def apply_fan_speed(fan_type: str, percent: int):
+    if IS_PREDATOR:
+        try:
+            PREDATOR_BACKEND.set_custom(fan_type, percent)
+            return True, "WMI"
+        except Exception as e:
+            try:
+                PREDATOR_BACKEND.set_native_mode("auto")
+            except Exception as restore_error:
+                return False, f"{e}; firmware Auto recovery failed: {restore_error}"
+            return False, str(e)
     fan_group_type = 1 if fan_type == "cpu" else 4
     data = (percent << 8) | fan_group_type
     packet = struct.pack("<HBIQ", 16, 1, 8, data)
@@ -143,6 +164,12 @@ def send_command_by_named_pipe(pipe, cmd_code: int, args: list):
     win32file.FlushFileBuffers(pipe)
 
 def get_acer_gaming_system_info(index: int):
+    if IS_PREDATOR:
+        try:
+            return PREDATOR_BACKEND.get_sensor(index) << 8
+        except Exception as e:
+            print("Predator sensor read failed:", e)
+            return None
     input_code = 1 | (index << 8)
     arg = struct.pack("<I", input_code)
     try:
@@ -189,8 +216,9 @@ class FanControlWidget(QWidget):
         layout = QHBoxLayout()
         self.label = QLabel(f"{self.fan_type.upper()} Fan Speed:")
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(0, 100)
-        self.slider.setValue(read_fan_percentage(self.fan_type))
+        self.slider.setRange(1 if IS_PREDATOR else 0, 100)
+        initial_speed = read_fan_percentage(self.fan_type)
+        self.slider.setValue(initial_speed if initial_speed > 0 else 50)
         self.value_label = QLabel(f"{self.slider.value()}%")
         self.slider.valueChanged.connect(self.on_slider_changed)
         self.apply_btn = QPushButton("Apply")
@@ -230,7 +258,14 @@ class FanControlWidget(QWidget):
         percent = self.slider.value()
         try:
             write_registry(self.fan_type, percent)
-            apply_fan_speed(self.fan_type, percent)
+            success, detail = apply_fan_speed(self.fan_type, percent)
+            if not success and IS_PREDATOR:
+                main = self.parentWidget()
+                while main and not isinstance(main, MainWindow):
+                    main = main.parentWidget()
+                if main:
+                    main.predator_failure(detail)
+                return
             if self.refresh_callback:
                 self.refresh_callback()
             # Save config to disk when Apply is clicked
@@ -250,7 +285,14 @@ class FanControlWidget(QWidget):
         """Set fan speed without changing slider or last_custom_value."""
         try:
             write_registry(self.fan_type, percent)
-            apply_fan_speed(self.fan_type, percent)
+            success, detail = apply_fan_speed(self.fan_type, percent)
+            if not success and IS_PREDATOR:
+                main = self.parentWidget()
+                while main and not isinstance(main, MainWindow):
+                    main = main.parentWidget()
+                if main:
+                    main.predator_failure(detail)
+                return
             if self.refresh_callback:
                 self.refresh_callback()
         except Exception:
@@ -707,6 +749,8 @@ class MainWindow(QWidget):
         mode_label = QLabel("Mode:")
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Custom", "Max", "Auto"])
+        if IS_PREDATOR:
+            self.mode_combo.addItem("Firmware Auto")
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         mode_layout.addWidget(mode_label)
         mode_layout.addWidget(self.mode_combo)
@@ -731,10 +775,15 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.gpu_speed_label)
 
         notice = QLabel(
-            '<b>Notice:</b> Please enable <span style="color:red">"Custom"</span> mode in NitroSense for fan control to work!'
+            '<b>Notice:</b> Predator WMI is experimental; keep PredatorSense to restore firmware Auto.'
+            if IS_PREDATOR else
+            '<b>Notice:</b> Enable "Custom" in NitroSense for fan control.'
         )
         notice.setWordWrap(True)
         self.layout.addWidget(notice)
+        self.hardware_status = QLabel("")
+        self.hardware_status.setWordWrap(True)
+        self.layout.addWidget(self.hardware_status)
 
         cpu_group = QGroupBox("CPU Fan")
         cpu_layout = QVBoxLayout()
@@ -790,32 +839,78 @@ class MainWindow(QWidget):
     def on_mode_changed(self, mode):
         self.current_mode = mode  # Track current mode
         self.config["mode"] = mode
+        self.hardware_status.setText("")
         # Save custom values if in custom mode
         if mode == "Custom":
             self.cpu_fan_widget.set_custom_mode(True)
             self.gpu_fan_widget.set_custom_mode(True)
             self.cpu_fan_widget.apply_fan_speed()
+            if IS_PREDATOR and self.current_mode != mode:
+                return
             self.gpu_fan_widget.apply_fan_speed()
+            if IS_PREDATOR and self.current_mode != mode:
+                return
             self.config["custom_cpu"] = self.cpu_fan_widget.slider.value()
             self.config["custom_gpu"] = self.gpu_fan_widget.slider.value()
         elif mode == "Max":
             self.cpu_fan_widget.set_custom_mode(False)
             self.gpu_fan_widget.set_custom_mode(False)
-            self.cpu_fan_widget.apply_fan_speed_direct(100)
-            self.gpu_fan_widget.apply_fan_speed_direct(100)
+            if IS_PREDATOR:
+                try:
+                    PREDATOR_BACKEND.set_native_mode("max")
+                except Exception as e:
+                    self.predator_failure(e)
+            else:
+                self.cpu_fan_widget.apply_fan_speed_direct(100)
+                self.gpu_fan_widget.apply_fan_speed_direct(100)
         elif mode == "Auto":
             self.cpu_fan_widget.set_custom_mode(False)
             self.gpu_fan_widget.set_custom_mode(False)
             self.apply_auto_fan_speeds()
+        elif mode == "Firmware Auto" and IS_PREDATOR:
+            self.cpu_fan_widget.set_custom_mode(False)
+            self.gpu_fan_widget.set_custom_mode(False)
+            try:
+                PREDATOR_BACKEND.set_native_mode("auto")
+            except Exception as e:
+                self.predator_failure(e)
+        if IS_PREDATOR and self.current_mode != mode:
+            return
         save_config(self.config)
+
+    def predator_failure(self, error):
+        """Fail closed and make recovery state visible instead of claiming success."""
+        try:
+            PREDATOR_BACKEND.set_native_mode("auto")
+        except Exception as restore_error:
+            self.current_mode = "Error"
+            self.config["mode"] = "Firmware Auto"  # Retry safest mode at next launch.
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(-1)  # Allow selecting Auto again to retry.
+            self.mode_combo.blockSignals(False)
+            self.hardware_status.setText(
+                f"Fan control error: {error}; Auto recovery failed: {restore_error}. "
+                "Restore Auto in PredatorSense immediately."
+            )
+        else:
+            self.current_mode = "Firmware Auto"
+            self.config["mode"] = self.current_mode
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentText(self.current_mode)
+            self.mode_combo.blockSignals(False)
+            self.hardware_status.setText(f"Fan command failed: {error}. Firmware Auto restored.")
+        save_config(self.config)
+        self.cpu_fan_widget.set_custom_mode(False)
+        self.gpu_fan_widget.set_custom_mode(False)
 
     def refresh_speeds(self):
         cpu_percent = read_fan_percentage("cpu")
         gpu_percent = read_fan_percentage("gpu")
         cpu_rpm = self.cpu_rpm if self.cpu_rpm is not None else '?'
         gpu_rpm = self.gpu_rpm if self.gpu_rpm is not None else '?'
-        cpu_text = f"CPU Fan Current Speed: {cpu_percent if cpu_percent >= 0 else '?'}% ({cpu_rpm} RPM)"
-        gpu_text = f"GPU Fan Current Speed: {gpu_percent if gpu_percent >= 0 else '?'}% ({gpu_rpm} RPM)"
+        label = "Last fan setting" if IS_PREDATOR else "Fan Current Speed"
+        cpu_text = f"CPU {label}: {cpu_percent if cpu_percent >= 0 else '?'}% ({cpu_rpm} RPM)"
+        gpu_text = f"GPU {label}: {gpu_percent if gpu_percent >= 0 else '?'}% ({gpu_rpm} RPM)"
         self.cpu_speed_label.setText(cpu_text)
         self.gpu_speed_label.setText(gpu_text)
 
@@ -840,6 +935,22 @@ class MainWindow(QWidget):
             self.apply_auto_fan_speeds()
 
     def closeEvent(self, event):
+        if IS_PREDATOR:
+            if hasattr(self, 'timer'):
+                self.timer.stop()
+            if hasattr(self, 'temp_worker'):
+                self.temp_worker.stop()
+                self.temp_worker.wait()
+            try:
+                PREDATOR_BACKEND.set_native_mode("auto")
+            except Exception as e:
+                self.hardware_status.setText(
+                    f"Could not restore firmware Auto: {e}. Restore Auto in PredatorSense before closing."
+                )
+                event.ignore()
+                return
+            event.accept()
+            return
         # Reload config from disk to discard unsaved in-memory changes
         self.config = load_config()
         self.auto_fan_config = self.config.get("auto_fan_config", DEFAULT_CONFIG["auto_fan_config"])
@@ -877,10 +988,24 @@ class MainWindow(QWidget):
         return 50
 
     def apply_auto_fan_speeds(self):
+        if IS_PREDATOR and (self.cpu_temp is None or self.gpu_temp is None):
+            try:
+                PREDATOR_BACKEND.set_native_mode("auto")
+            except Exception as e:
+                self.predator_failure(e)
+            return
         # Use the config for both CPU and GPU, or you can split if you want
         cpu_speed = self.get_auto_fan_speed(self.cpu_temp, self.auto_fan_config)
         gpu_speed = self.get_auto_fan_speed(self.gpu_temp, self.auto_fan_config)
+        if IS_PREDATOR and (cpu_speed <= 0 or gpu_speed <= 0):
+            try:
+                PREDATOR_BACKEND.set_native_mode("auto")
+            except Exception as e:
+                self.predator_failure(e)
+            return
         self.cpu_fan_widget.apply_fan_speed_direct(cpu_speed)
+        if IS_PREDATOR and self.current_mode != "Auto":
+            return
         self.gpu_fan_widget.apply_fan_speed_direct(gpu_speed)
 
 def main():

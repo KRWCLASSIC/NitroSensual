@@ -34,3 +34,26 @@ Double click and use GUI to control your fans!
 
 - You must enable "Custom" mode in NitroSense for fan control to work.
 - You must have PredatorSense service (PSsvc) running to use this app.
+
+## Experimental Predator PHN16S-71 support (source checkout)
+
+On this exact Acer model, the source version uses `root\WMI:AcerGamingFunction`
+instead of the NitroSense registry and legacy PredatorSense named pipe. This
+route has unit tests and its WMI backend was validated on a Predator
+PHN16S-71 with PredatorSense 5.1.514.0: a short 50% CPU/GPU trial reported
+50% for both fans, raised RPM, and successfully restored firmware Auto.
+The full GUI has only been smoke-tested with WMI mocked; do not assume
+other Predator models behave the same way. Keep PredatorSense installed to
+restore firmware Auto mode if the process crashes; avoid running it concurrently
+with this app because the two programs can override each other's fan settings.
+Administrator permissions are required for WMI access. Other models continue
+to use the legacy path.
+
+The UI's Auto mode is a configurable temperature curve; it is *not* firmware
+Auto. If either temperature is unavailable or the curve requests 0%, the
+Predator route returns control to firmware Auto rather than writing 0% duty.
+Repeated, unchanged fan duty is not resent. Test with working temperature and
+RPM readings before using Custom or the temperature curve.
+
+Run the offline tests with `python -m unittest discover -s tests -v`; tests
+mock WMI and do not change fan settings.
